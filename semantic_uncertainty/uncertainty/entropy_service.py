@@ -1,6 +1,7 @@
 """
 Semantic entropy HTTP service for HASHIRU (Option B – Service 1).
-Run in the semantic_uncertainty conda env from this directory (the inner semantic_uncertainty folder).
+Run in the semantic_uncertainty conda env. PYTHONPATH must include the directory
+that contains the 'uncertainty' package (the inner semantic_uncertainty folder).
 
   cd .../semantic_uncertainty/semantic_uncertainty
   export PYTHONPATH="$(pwd)"
@@ -8,11 +9,20 @@ Run in the semantic_uncertainty conda env from this directory (the inner semanti
 
 Expects POST /score with body: { "prompt", "responses", "samples?", "metadata?" }.
 Returns { "entropy": [float], "clusters": [...], "reasons": {} }.
+
+The "loading weights" message refers to the NLI model (DeBERTa), not your agent/worker LLM.
+Set STRICT_ENTAILMENT=false to use loose clustering (more clusters, less often entropy=0).
 """
 from __future__ import annotations
 
+import os
 import logging
 from typing import Any, Dict, List, Optional
+
+# Reduce HuggingFace/httpx log noise (404s for optional files like adapter_config.json are normal)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+logging.getLogger("transformers").setLevel(logging.WARNING)
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -90,7 +100,6 @@ def score(req: ScoreRequest) -> EntropyScoreResponse:
     n_resp = len(req.responses)
     n_samples_per = [len(req.samples[i]) if req.samples else 0 for i in range(n_resp)]
     logger.info("entropy request: %s response(s), samples per response: %s", n_resp, n_samples_per)
-
     model = get_model()
     entropies: List[float] = []
     all_clusters: List[Any] = []
@@ -103,21 +112,24 @@ def score(req: ScoreRequest) -> EntropyScoreResponse:
             entropies.append(0.0)
             all_clusters.append([])
             continue
-        # Use last 100 words of each response (conclusions/verdicts) so differing recommendations get different clusters
-        truncated = [_last_n_words(r, n=100) for r in all_responses]
+        last_n = int(os.environ.get("ENTROPY_LAST_N_WORDS", "100"))
+        truncated = [_last_n_words(r, n=last_n) for r in all_responses]
         with_question = [_prepend_question(req.prompt, t) for t in truncated]
         word_lens = [len(s.split()) for s in with_question]
-        logger.info("entropy item %s: %s strings (question + last 100 words of answer); word counts: %s", i, n_strings, word_lens)
+        strict_entailment = os.environ.get("STRICT_ENTAILMENT", "true").lower() in ("1", "true", "yes")
+        raw_threshold = os.environ.get("ENTAILMENT_THRESHOLD", "").strip()
+        entailment_threshold = float(raw_threshold) if raw_threshold else None
+        logger.info("entropy item %s: %s strings (question + last %s words); word counts: %s; strict_entailment=%s; entailment_threshold=%s", i, n_strings, last_n, word_lens, strict_entailment, entailment_threshold)
         try:
-            # strict_entailment=True: only mutual entailment = same cluster (fewer false merges)
             semantic_ids = get_semantic_ids(
                 with_question,
                 model=model,
-                strict_entailment=True,
+                strict_entailment=strict_entailment,
                 example=None,
+                entailment_threshold=entailment_threshold,
             )
             ent = float(cluster_assignment_entropy(semantic_ids))
-            ent = max(0.0, ent)  # entropy is non-negative (avoid -0.0)
+            ent = max(0.0, ent)
             n_clusters = len(set(semantic_ids))
             logger.info("entropy item %s: semantic_ids=%s → %s cluster(s), entropy=%.4f", i, semantic_ids, n_clusters, ent)
             entropies.append(ent)
@@ -137,3 +149,4 @@ def score(req: ScoreRequest) -> EntropyScoreResponse:
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "entropy"}
+
