@@ -30,7 +30,14 @@ class EntailmentDeberta(BaseEntailment):
             "microsoft/deberta-v2-xlarge-mnli").to(DEVICE)
 
     def check_implication(self, text1, text2, *args, **kwargs):
-        inputs = self.tokenizer(text1, text2, return_tensors="pt").to(DEVICE)
+        # DeBERTa max length is 512; truncate so we avoid "Token indices sequence length is longer than 512"
+        inputs = self.tokenizer(
+            text1, text2,
+            return_tensors="pt",
+            max_length=512,
+            truncation=True,
+            padding="max_length",
+        ).to(DEVICE)
         # The model checks if text1 -> text2, i.e. if text2 follows from text1.
         # check_implication('The weather is good', 'The weather is good and I like you') --> 1
         # check_implication('The weather is good and I like you', 'The weather is good') --> 2
@@ -44,6 +51,20 @@ class EntailmentDeberta(BaseEntailment):
             logging.info('Deberta Prediction: %s', prediction)
 
         return prediction
+
+    def check_implication_probs(self, text1, text2, *args, **kwargs):
+        """Return (p_contradiction, p_neutral, p_entailment) for text1 -> text2. Used for threshold-based clustering."""
+        inputs = self.tokenizer(
+            text1, text2,
+            return_tensors="pt",
+            max_length=512,
+            truncation=True,
+            padding="max_length",
+        ).to(DEVICE)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+        probs = F.softmax(outputs.logits, dim=1)[0].cpu().numpy()
+        return (float(probs[0]), float(probs[1]), float(probs[2]))
 
 
 class EntailmentLLM(BaseEntailment):
@@ -166,11 +187,22 @@ def context_entails_response(context, responses, model):
     return 2 - np.mean(votes)
 
 
-def get_semantic_ids(strings_list, model, strict_entailment=False, example=None):
-    """Group list of predictions into semantic meaning."""
+def get_semantic_ids(strings_list, model, strict_entailment=False, example=None, entailment_threshold=None):
+    """Group list of predictions into semantic meaning.
+
+    If entailment_threshold is set (e.g. 0.9) and model has check_implication_probs, two texts
+    are equivalent only if both directions have P(entailment) >= threshold (stricter clustering).
+    """
+    use_probs = (
+        entailment_threshold is not None
+        and getattr(model, "check_implication_probs", None) is not None
+    )
 
     def are_equivalent(text1, text2):
-
+        if use_probs:
+            _, _, p_e_12 = model.check_implication_probs(text1, text2, example=example)
+            _, _, p_e_21 = model.check_implication_probs(text2, text1, example=example)
+            return p_e_12 >= entailment_threshold and p_e_21 >= entailment_threshold
         implication_1 = model.check_implication(text1, text2, example=example)
         implication_2 = model.check_implication(text2, text1, example=example)  # pylint: disable=arguments-out-of-order
         assert (implication_1 in [0, 1, 2]) and (implication_2 in [0, 1, 2])
