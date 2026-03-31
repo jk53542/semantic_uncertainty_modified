@@ -10,14 +10,24 @@ that contains the 'uncertainty' package (the inner semantic_uncertainty folder).
 Expects POST /score with body: { "prompt", "responses", "samples?", "metadata?" }.
 Returns { "entropy": [float], "clusters": [...], "reasons": {} }.
 
+Optional **metadata["sequence_logprobs"]**: one summed log-likelihood per string in
+`[responses[i]] + samples[i]` (same order as the service). When all values are finite
+and length matches, entropy uses predictive (Rao–Blackwell) semantic entropy
+(`logsumexp_by_id` + `predictive_entropy_rao`). If missing, wrong length, or any
+`null`/non-finite entry, the score falls back to cluster-assignment entropy only.
+
+Set ENTROPY_USE_SEQUENCE_LOGPROBS=0 to always use cluster-assignment entropy.
+
 The "loading weights" message refers to the NLI model (DeBERTa), not your agent/worker LLM.
-Set STRICT_ENTAILMENT=false to use loose clustering (more clusters, less often entropy=0).
+STRICT_ENTAILMENT=false. ENTAILMENT_THRESHOLD=0.5. REQUIRE_ENTAILMENT_WINNER=at_least_one (default): merge only when at least one direction is entailment, so (1,1) and contradiction never merge; true=both entailment, false=allow (1,1).
 """
 from __future__ import annotations
 
 import os
 import logging
 from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 # Reduce HuggingFace/httpx log noise (404s for optional files like adapter_config.json are normal)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -32,6 +42,8 @@ from uncertainty.uncertainty_measures.semantic_entropy import (
     EntailmentDeberta,
     get_semantic_ids,
     cluster_assignment_entropy,
+    logsumexp_by_id,
+    predictive_entropy_rao,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -90,6 +102,47 @@ def _prepend_question(question: str, answer_chunk: str, question_max_words: int 
     return f"Question: {q_prefix}. Answer: {answer_chunk}"
 
 
+def _env_use_sequence_logprobs() -> bool:
+    v = os.environ.get("ENTROPY_USE_SEQUENCE_LOGPROBS", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _parse_sequence_logprobs(
+    metadata: Optional[Dict[str, Any]],
+    item_index: int,
+    n_strings: int,
+    n_responses: int,
+) -> Optional[List[float]]:
+    """Return per-string log-likelihoods for this item, or None if unusable."""
+    if not metadata:
+        return None
+    raw = metadata.get("sequence_logprobs")
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)) and len(raw) > 0 and isinstance(raw[0], (list, tuple)):
+        if item_index >= len(raw):
+            return None
+        seq = list(raw[item_index])
+    else:
+        if item_index != 0 and n_responses > 1:
+            return None
+        seq = list(raw)
+    if len(seq) != n_strings:
+        return None
+    out: List[float] = []
+    for x in seq:
+        if x is None:
+            return None
+        try:
+            f = float(x)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(f):
+            return None
+        out.append(f)
+    return out
+
+
 @app.post("/score", response_model=EntropyScoreResponse)
 def score(req: ScoreRequest) -> EntropyScoreResponse:
     if req.samples is not None and len(req.samples) != len(req.responses):
@@ -103,6 +156,9 @@ def score(req: ScoreRequest) -> EntropyScoreResponse:
     model = get_model()
     entropies: List[float] = []
     all_clusters: List[Any] = []
+    entropy_modes: List[str] = []
+    used_logprobs_flags: List[bool] = []
+    use_lp = _env_use_sequence_logprobs()
     for i, resp in enumerate(req.responses):
         samples_i = req.samples[i] if req.samples else []
         all_responses = [resp] + list(samples_i)
@@ -111,15 +167,24 @@ def score(req: ScoreRequest) -> EntropyScoreResponse:
             logger.info("entropy item %s: only %s string(s), need ≥2 → entropy=0.0", i, n_strings)
             entropies.append(0.0)
             all_clusters.append([])
+            entropy_modes.append("trivial_single")
+            used_logprobs_flags.append(False)
             continue
         last_n = int(os.environ.get("ENTROPY_LAST_N_WORDS", "100"))
         truncated = [_last_n_words(r, n=last_n) for r in all_responses]
         with_question = [_prepend_question(req.prompt, t) for t in truncated]
         word_lens = [len(s.split()) for s in with_question]
-        strict_entailment = os.environ.get("STRICT_ENTAILMENT", "true").lower() in ("1", "true", "yes")
+        # Default false = loose clustering (equivalent = not contradiction and not both neutral); identical/paraphrases merge.
+        strict_entailment = os.environ.get("STRICT_ENTAILMENT", "false").lower() in ("1", "true", "yes")
         raw_threshold = os.environ.get("ENTAILMENT_THRESHOLD", "").strip()
-        entailment_threshold = float(raw_threshold) if raw_threshold else None
-        logger.info("entropy item %s: %s strings (question + last %s words); word counts: %s; strict_entailment=%s; entailment_threshold=%s", i, n_strings, last_n, word_lens, strict_entailment, entailment_threshold)
+        # Default 0.5 with at_least_one: merge when one direction is entailment; (1,1) and contradiction never merge.
+        default_threshold = 0.35
+        entailment_threshold = float(raw_threshold) if raw_threshold else default_threshold
+        raw_winner = os.environ.get("REQUIRE_ENTAILMENT_WINNER", "at_least_one").strip().lower()
+        require_entailment_winner = True if raw_winner in ("1", "true", "yes") else (False if raw_winner in ("0", "false", "no") else "at_least_one")
+        raw_neutral = os.environ.get("NEUTRAL_MERGE_THRESHOLD", "").strip()
+        neutral_merge_threshold = float(raw_neutral) if raw_neutral else None
+        logger.info("entropy item %s: %s strings; strict_entailment=%s; entailment_threshold=%s; require_entailment_winner=%s; neutral_merge_threshold=%s", i, n_strings, strict_entailment, entailment_threshold, require_entailment_winner, neutral_merge_threshold)
         try:
             semantic_ids = get_semantic_ids(
                 with_question,
@@ -127,22 +192,66 @@ def score(req: ScoreRequest) -> EntropyScoreResponse:
                 strict_entailment=strict_entailment,
                 example=None,
                 entailment_threshold=entailment_threshold,
+                require_entailment_winner=require_entailment_winner,
+                neutral_merge_threshold=neutral_merge_threshold,
             )
-            ent = float(cluster_assignment_entropy(semantic_ids))
-            ent = max(0.0, ent)
+            cluster_ent = float(cluster_assignment_entropy(semantic_ids))
+            cluster_ent = max(0.0, cluster_ent)
+            mode = "cluster_assignment"
+            ent = cluster_ent
+            used_lp_here = False
+            seq_lp = None
+            if use_lp:
+                seq_lp = _parse_sequence_logprobs(
+                    req.metadata, i, n_strings, n_resp
+                )
+            if seq_lp is not None:
+                try:
+                    log_lik_sem = logsumexp_by_id(
+                        semantic_ids,
+                        np.asarray(seq_lp, dtype=np.float64),
+                        agg="sum_normalized",
+                    )
+                    ent = float(predictive_entropy_rao(log_lik_sem))
+                    ent = max(0.0, ent)
+                    mode = "predictive_rao"
+                    used_lp_here = True
+                except Exception as lp_exc:
+                    logger.warning(
+                        "entropy item %s: predictive_rao failed (%s), using cluster_assignment_entropy",
+                        i,
+                        lp_exc,
+                    )
+                    ent = cluster_ent
+                    mode = "cluster_assignment_fallback"
             n_clusters = len(set(semantic_ids))
-            logger.info("entropy item %s: semantic_ids=%s → %s cluster(s), entropy=%.4f", i, semantic_ids, n_clusters, ent)
+            logger.info(
+                "entropy item %s: semantic_ids=%s → %s cluster(s), mode=%s, entropy=%.4f",
+                i,
+                semantic_ids,
+                n_clusters,
+                mode,
+                ent,
+            )
             entropies.append(ent)
             all_clusters.append(semantic_ids)
+            entropy_modes.append(mode)
+            used_logprobs_flags.append(used_lp_here)
         except Exception as e:
             logger.exception("entropy item %s: computation failed: %s", i, e)
             entropies.append(0.0)
             all_clusters.append([])
+            entropy_modes.append("error")
+            used_logprobs_flags.append(False)
     logger.info("entropy response: entropies=%s", entropies)
     return EntropyScoreResponse(
         entropy=entropies,
         clusters=all_clusters,
-        reasons={"n": len(req.responses)},
+        reasons={
+            "n": len(req.responses),
+            "entropy_modes": entropy_modes,
+            "used_sequence_logprobs": used_logprobs_flags,
+        },
     )
 
 
