@@ -187,12 +187,19 @@ def context_entails_response(context, responses, model):
     return 2 - np.mean(votes)
 
 
-def get_semantic_ids(strings_list, model, strict_entailment=False, example=None, entailment_threshold=None):
+def get_semantic_ids(strings_list, model, strict_entailment=False, example=None, entailment_threshold=None, require_entailment_winner="at_least_one", neutral_merge_threshold=None):
     """Group list of predictions into semantic meaning.
 
-    If entailment_threshold is set (e.g. 0.9) and model has check_implication_probs, two texts
-    are equivalent only if both directions have P(entailment) >= threshold (stricter clustering).
+    When using entailment_threshold and check_implication_probs, two texts are equivalent only if
+    both have P(entailment) >= threshold and neither is contradiction. require_entailment_winner:
+    - "at_least_one" (default): merge when at least one direction is entailment (2), OR when both
+      are neutral (1,1) and both p_entailment >= neutral_merge_threshold (so paraphrases merge).
+    - True: merge only when both directions are entailment (2,2); strictest.
+    - False: merge when neither is contradiction (allows any (1,1)); merges most.
+    neutral_merge_threshold: when "at_least_one", (1,1) pairs merge if both p_e >= this (default 0.4); no entailment_threshold required for (1,1).
     """
+    if require_entailment_winner == "at_least_one" and neutral_merge_threshold is None:
+        neutral_merge_threshold = 0.4
     use_probs = (
         entailment_threshold is not None
         and getattr(model, "check_implication_probs", None) is not None
@@ -200,9 +207,26 @@ def get_semantic_ids(strings_list, model, strict_entailment=False, example=None,
 
     def are_equivalent(text1, text2):
         if use_probs:
-            _, _, p_e_12 = model.check_implication_probs(text1, text2, example=example)
-            _, _, p_e_21 = model.check_implication_probs(text2, text1, example=example)
-            return p_e_12 >= entailment_threshold and p_e_21 >= entailment_threshold
+            p_c_12, p_n_12, p_e_12 = model.check_implication_probs(text1, text2, example=example)
+            p_c_21, p_n_21, p_e_21 = model.check_implication_probs(text2, text1, example=example)
+            above = p_e_12 >= entailment_threshold and p_e_21 >= entailment_threshold
+            winner_12 = np.argmax([p_c_12, p_n_12, p_e_12])
+            winner_21 = np.argmax([p_c_21, p_n_21, p_e_21])
+            no_contra = winner_12 != 0 and winner_21 != 0
+            if require_entailment_winner is True:
+                above = above and (winner_12 == 2 and winner_21 == 2)
+            elif require_entailment_winner == "at_least_one":
+                # Merge when (at least one entailment and above threshold) OR (1,1) with both p_e >= neutral_merge_threshold only
+                at_least_one_ent = no_contra and (winner_12 == 2 or winner_21 == 2)
+                both_neutral_high = (
+                    neutral_merge_threshold is not None
+                    and winner_12 == 1 and winner_21 == 1
+                    and p_e_12 >= neutral_merge_threshold and p_e_21 >= neutral_merge_threshold
+                )
+                return (above and at_least_one_ent) or both_neutral_high
+            else:
+                above = above and no_contra
+            return above
         implication_1 = model.check_implication(text1, text2, example=example)
         implication_2 = model.check_implication(text2, text1, example=example)  # pylint: disable=arguments-out-of-order
         assert (implication_1 in [0, 1, 2]) and (implication_2 in [0, 1, 2])
@@ -217,23 +241,18 @@ def get_semantic_ids(strings_list, model, strict_entailment=False, example=None,
 
         return semantically_equivalent
 
-    # Initialise all ids with -1.
+    # Greedy assignment: assign same id when equivalent to the first item in the cluster (fewer pairwise calls than full graph).
     semantic_set_ids = [-1] * len(strings_list)
-    # Keep track of current id.
     next_id = 0
     for i, string1 in enumerate(strings_list):
-        # Check if string1 already has an id assigned.
         if semantic_set_ids[i] == -1:
-            # If string1 has not been assigned an id, assign it next_id.
             semantic_set_ids[i] = next_id
-            for j in range(i+1, len(strings_list)):
-                # Search through all remaining strings. If they are equivalent to string1, assign them the same id.
+            for j in range(i + 1, len(strings_list)):
                 if are_equivalent(string1, strings_list[j]):
                     semantic_set_ids[j] = next_id
             next_id += 1
 
     assert -1 not in semantic_set_ids
-
     return semantic_set_ids
 
 
